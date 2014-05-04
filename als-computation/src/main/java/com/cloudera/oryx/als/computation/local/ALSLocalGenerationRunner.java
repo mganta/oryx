@@ -15,6 +15,9 @@
 
 package com.cloudera.oryx.als.computation.local;
 
+import com.cloudera.oryx.als.computation.ALSJobStepConfig;
+import com.cloudera.oryx.als.computation.modelbuilder.ALSModelBuilder;
+import com.cloudera.oryx.computation.common.supplier.MRPipelineSupplier;
 import com.google.common.io.Files;
 import com.typesafe.config.Config;
 
@@ -32,11 +35,17 @@ import com.cloudera.oryx.common.servcomp.Store;
 import com.cloudera.oryx.common.settings.ConfigUtils;
 import com.cloudera.oryx.computation.common.JobException;
 import com.cloudera.oryx.computation.common.LocalGenerationRunner;
+import org.apache.crunch.Pipeline;
+import org.apache.crunch.impl.mem.MemPipeline;
+import org.apache.crunch.impl.mr.MRPipeline;
+import org.apache.crunch.impl.spark.SparkPipeline;
+import org.apache.crunch.io.From;
+import org.apache.hadoop.conf.Configuration;
 
 public final class ALSLocalGenerationRunner extends LocalGenerationRunner {
 
   @Override
-  protected void runSteps() throws IOException, InterruptedException, JobException {
+  protected void runSteps() throws IOException {
 
     String instanceDir = getInstanceDir();
     int generationID = getGenerationID();
@@ -74,44 +83,12 @@ public final class ALSLocalGenerationRunner extends LocalGenerationRunner {
         store.downloadDirectory(lastGenerationPrefix + "test/", lastTestDir);
       }
 
-      new SplitTestTrain(currentInboundDir, currentTrainDir, currentTestDir).call();
-
-      Config config = ConfigUtils.getDefaultConfig();
-
-      boolean noKnownItems = config.getBoolean("model.no-known-items");
-      LongObjectMap<LongSet> knownItemIDs = noKnownItems ? null : new LongObjectMap<LongSet>();
-      LongObjectMap<LongFloatMap> RbyRow = new LongObjectMap<LongFloatMap>();
-      LongObjectMap<LongFloatMap> RbyColumn = new LongObjectMap<LongFloatMap>();
-      StringLongMapping idMapping = new StringLongMapping();
-
-      if (lastGenerationID >= 0) {
-        new ReadInputs(lastInputDir, false, knownItemIDs, RbyRow, RbyColumn, idMapping).call();
-        new ReadInputs(lastTestDir, false, knownItemIDs, RbyRow, RbyColumn, idMapping).call();
-        new ReadMapping(lastMappingDir, idMapping).call();
-      }
-      new ReadInputs(currentTrainDir, true, knownItemIDs, RbyRow, RbyColumn, idMapping).call();
-
-      if (RbyRow.isEmpty() || RbyColumn.isEmpty()) {
-        return;
-      }
-
-      MatrixFactorizer als = new FactorMatrix(RbyRow, RbyColumn).call();
-
-      new WriteOutputs(tempOutDir, RbyRow, knownItemIDs, als.getX(), als.getY(), idMapping).call();
-
-      if (config.getDouble("model.test-set-fraction") > 0.0) {
-        new ComputeMAP(currentTestDir, als.getX(), als.getY()).call();
-      }
-
-      if (config.getBoolean("model.recommend.compute")) {
-        new MakeRecommendations(tempOutDir, knownItemIDs, als.getX(), als.getY(), idMapping).call();
-      }
-
-      if (config.getBoolean("model.item-similarity.compute")) {
-        new MakeItemSimilarity(tempOutDir, als.getY(), idMapping).call();
-      }
-
+      ALSModelBuilder modelBuilder = new ALSModelBuilder(store);
+      Pipeline sp = new SparkPipeline("local", "als", this.getClass());
+      modelBuilder.build(sp.readTextFile(currentInboundDir.getAbsolutePath()),
+          new ALSJobStepConfig(getInstanceDir(), getGenerationID(), getLastGenerationID(), 0, false));
       store.uploadDirectory(generationPrefix, tempOutDir, false);
+      sp.done();
 
     } finally {
       IOUtils.deleteRecursively(currentInboundDir);
